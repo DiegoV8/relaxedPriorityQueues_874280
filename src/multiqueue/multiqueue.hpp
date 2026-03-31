@@ -5,6 +5,7 @@
 #include <optional>
 #include <functional>
 #include <random>
+#include <mutex>
 
 /**
  * @brief Interfaz para una Multiqueue.
@@ -48,7 +49,7 @@ public:
         // Insercion
         std::size_t i = distribution(generator);
         {
-            std::lock_guard<std::mutex> lock(queues[i].mtx); // Bloqueamos la cola antes de insertar nada, se desbloquea al destruirse lock
+            std::lock_guard<std::mutex> lock(queues[i].M); // Bloqueamos la cola antes de insertar nada, se desbloquea al destruirse lock
             queues[i].pq.push(value);
         }
     }
@@ -70,7 +71,7 @@ public:
             std::size_t idx = distribution(generator);
             
             // Intentamos bloquear sin quedarnos dormidos (try_lock)
-            if (queues[idx].mtx.try_lock()) {
+            if (queues[idx].M.try_lock()) {
                 if (!queues[idx].pq.empty()) {
                     locked_indices.push_back(idx);
                     
@@ -80,14 +81,14 @@ public:
                     }
                 } else {
                     // Si estaba vacía, la desbloqueamos ya
-                    queues[idx].mtx.unlock();
+                    queues[idx].M.unlock();
                 }
             }
         }
 
         // Si no hemos podido bloquear ninguna con datos, devolvemos vacío
         if (best_idx == -1) {
-            for (std::size_t idx : locked_indices) queues[idx].mtx.unlock();
+            for (std::size_t idx : locked_indices) queues[idx].M.unlock();
             return std::nullopt;
         }
 
@@ -97,7 +98,7 @@ public:
 
         // Desbloqueamos el resto de colas
         for (std::size_t idx : locked_indices) {
-            queues[idx].mtx.unlock();
+            queues[idx].M.unlock();
         }
 
         return result;
@@ -108,7 +109,7 @@ public:
      */
     bool empty() const {
         for (std::size_t i = 0; i < n; i++){
-            std::lock_guard<std::mutex> lock(queues[i].mtx); // Bloqueamos el mutex para que no se actualice mientras comprobamos el resto
+            std::lock_guard<std::mutex> lock(queues[i].M); // Bloqueamos el mutex para que no se actualice mientras comprobamos el resto
             if (!queues[i].pq.empty()) return false;
         }
         return true;
@@ -120,7 +121,7 @@ public:
     std::size_t size() const {
         std::size_t sum = 0;
         for (std::size_t i = 0; i < n; i++){
-            std::lock_guard<std::mutex> lock(queues[i].mtx); // Bloqueamos el mutex para que no se actualice mientras sumamos el resto
+            std::lock_guard<std::mutex> lock(queues[i].M); // Bloqueamos el mutex para que no se actualice mientras sumamos el resto
             sum += queues[i].pq.size();
         }
         return sum;
@@ -129,7 +130,7 @@ public:
 private:
     struct Q { // Representa cada una de las colas de la multiqueue
         std::priority_queue<T, std::vector<T>, Compare> pq;
-        std::mutex mtx;
+        std::mutex M;
 
         // Inicializa la pq con el comparador
         Q(const Compare& comp) : pq(comp) {}
