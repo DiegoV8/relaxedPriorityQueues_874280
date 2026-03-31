@@ -23,7 +23,7 @@ public:
      * @param c Número de sub-colas que se comparan al extraer elementos.
      * @param comp Instancia del comparador de prioridad.
      */
-    explicit RelaxedPriorityQueue(std::size_t n = 8, int c = 2, Compare comp = Compare()) {
+    explicit Multiqueue(std::size_t n = 8, int c = 2, Compare comp = Compare()) {
         this->n = n;
         this->c = c;
         this->comp = comp;
