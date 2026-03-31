@@ -7,6 +7,7 @@
 #include <random>
 #include <mutex>
 #include <memory>
+#include <algorithm>
 
 /**
  * @brief Interfaz para una Multiqueue.
@@ -65,18 +66,26 @@ public:
         std::vector<std::size_t> locked_indices;
         int best_idx = -1;
 
+        // Intentamos muestrear y bloquear hasta 'c' colas
         for (int i = 0; i < c; ++i) {
             std::size_t idx = distribution(generator);
             
+            // Comprobamos si ya tenemos esta cola bloqueada
+            if (std::find(locked_indices.begin(), locked_indices.end(), idx) != locked_indices.end()) {
+                continue; // Ya la tenemos, pasamos al siguiente intento
+            }
+            
+            // Intentamos bloquear
             if (queues[idx]->M.try_lock()) {
                 if (!queues[idx]->pq.empty()) {
                     locked_indices.push_back(idx);
                     
-                    // Comprobamos usando -> 
+                    // Comprobamos si es el elemento con mayor prioridad
                     if (best_idx == -1 || comp(queues[best_idx]->pq.top(), queues[idx]->pq.top())) {
                         best_idx = idx;
                     }
                 } else {
+                    // Si estaba vacía, la desbloqueamos ya
                     queues[idx]->M.unlock();
                 }
             }
