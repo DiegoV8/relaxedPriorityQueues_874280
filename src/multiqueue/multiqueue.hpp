@@ -7,6 +7,7 @@
 #include <random>
 #include <mutex>
 #include <memory>
+#include <algorithm>
 
 /**
  * @brief Interfaz para una Multiqueue.
@@ -43,10 +44,8 @@ public:
      * @brief Inserta un elemento de forma concurrente.
      */
     void push(const T& value){
-        static thread_local std::mt19937 generator(std::random_device{}());
-        std::uniform_int_distribution<std::size_t> distribution(0, n - 1);
         
-        std::size_t i = distribution(generator);
+        std::size_t i = fast_rand(n);
         {
             // Usamos -> porque ahora queues[i] es un puntero
             std::lock_guard<std::mutex> lock(queues[i]->M); 
@@ -59,24 +58,30 @@ public:
      * @return std::optional con el valor, o nullopt si la estructura está saturada o vacía.
      */
     std::optional<T> try_pop() {
-        static thread_local std::mt19937 generator(std::random_device{}());
-        std::uniform_int_distribution<std::size_t> distribution(0, n - 1);
 
         std::vector<std::size_t> locked_indices;
         int best_idx = -1;
 
+        // Intentamos muestrear y bloquear hasta 'c' colas
         for (int i = 0; i < c; ++i) {
-            std::size_t idx = distribution(generator);
+            std::size_t idx = fast_rand(n);
             
+            // Comprobamos si ya tenemos esta cola bloqueada
+            if (std::find(locked_indices.begin(), locked_indices.end(), idx) != locked_indices.end()) {
+                continue; // Ya la tenemos, pasamos al siguiente intento
+            }
+            
+            // Intentamos bloquear
             if (queues[idx]->M.try_lock()) {
                 if (!queues[idx]->pq.empty()) {
                     locked_indices.push_back(idx);
                     
-                    // Comprobamos usando -> 
+                    // Comprobamos si es el elemento con mayor prioridad
                     if (best_idx == -1 || comp(queues[best_idx]->pq.top(), queues[idx]->pq.top())) {
                         best_idx = idx;
                     }
                 } else {
+                    // Si estaba vacía, la desbloqueamos ya
                     queues[idx]->M.unlock();
                 }
             }
@@ -121,6 +126,20 @@ public:
     }
 
 private:
+
+    inline std::size_t fast_rand(std::size_t max_val) { // Algoritmo de numeros aleatorios Xorshift
+        static thread_local uint32_t state = []() {
+            uint32_t seed = std::random_device{}();
+            return seed == 0 ? 1 : seed;
+        }();
+        
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        
+        return state % max_val;
+    }
+
     struct Q { // Representa cada una de las colas de la multiqueue
         std::priority_queue<T, std::vector<T>, Compare> pq;
         mutable std::mutex M;
