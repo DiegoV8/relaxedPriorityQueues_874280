@@ -127,6 +127,10 @@ public:
 
 private:
 
+    /**
+    * @brief Genera un numero aleatorio en [0, max_val]
+    * @param max_val Valor máximo generado 
+    */
     inline std::size_t fast_rand(std::size_t max_val) { // Algoritmo de numeros aleatorios Xorshift
         static thread_local uint32_t state = []() {
             uint32_t seed = std::random_device{}();
