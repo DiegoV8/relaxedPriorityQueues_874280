@@ -5,14 +5,36 @@
 #include <optional>
 #include <functional>
 #include <mutex>
+#include <atomic> // Para std::atomic, std::atomic_flag y std::memory_order_*
+#include <thread> // Para std::this_thread::yield()
+#include <array>  // Para std::array<...> en push y la estructura node
+#include <random> // Para std::random_device en fast_rand
+
+class Spinlock {
+    std::atomic_flag locked = ATOMIC_FLAG_INIT;
+public:
+    void lock() {
+        // Intentamos adquirir el cerrojo activamente
+        while (locked.test_and_set(std::memory_order_acquire)) {
+            // Ceder un poco la CPU evita quemar el 100% si hay alta contención
+            std::this_thread::yield(); 
+        }
+    }
+    void unlock() {
+        locked.clear(std::memory_order_release);
+    }
+};
 
 /**
  * @brief Interfaz para una Cola de Prioridad Relajada.
  * @tparam T Tipo de dato (en Viltrum será ExtendedRegion).
  * @tparam Compare Comparador (equivalente a heap_ordering).
  */
-template <typename T, typename Compare = std::less<T>>
+template <typename T, typename Compare = std::greater<T>>
 class Skiplist {
+private:
+    static constexpr std::size_t MAX_LEVEL = 32;
+
 public:
     // Alias para compatibilidad con el benchmark
     using value_type = T;
@@ -21,112 +43,242 @@ public:
      * @brief Constructor que define el grado de relajación.
      * @param comp Instancia del comparador de prioridad.
      */
-    explicit Skiplist(Compare comp = Compare()){
-        this->n = n;
+    explicit Skiplist(Compare comp = Compare(), int rel_factor = 0){
         this->comp = comp;
         this->current_level = 1;
         this->_size = 0;
+        this->relaxation_factor = rel_factor;
 
-        // Inicializamos NIL a nivel 0 ya que es el nodo final
         NIL = new node(T(), 0, nullptr);
-
-        // Inicializamos el header a nivel máximo con todos sus punteros apuntando a NIL
         header = new node(T(), MAX_LEVEL, NIL);
+    }
+
+    ~Skiplist() {
+        node* curr = header;
+        while (curr != nullptr) {
+            node* next = nullptr;
+            // Solo intentamos leer el siguiente si no somos el nodo final
+            if (curr != NIL) {
+                next = curr->forward[0].load(std::memory_order_relaxed);
+            }
+            delete curr;
+            curr = next;
+        }
     }
 
     /**
      * @brief Inserta un elemento de forma concurrente.
      */
-    void push(const T& value) {
-        node* update[MAX_LEVEL];
-        node* curr = header;
+    void push(T value) {
+        // 'update' guardará el predecesor de nuestro nuevo elemento en cada nivel.
+        std::array<node*, MAX_LEVEL> update;
+        node* pred = header;
 
-        // Búsqueda inicial (sin locks) para rellenar update[]
+        // PASO 1: Búsqueda relajada (WeakSearch)
+        // Buscamos de arriba hacia abajo sin tomar cerrojos. 
+        // Nota: Para evitar condiciones de carrera (UB) con un current_level no atómico,
+        // iteramos desde el MAX_LEVEL. El costo es nulo porque las referencias a NIL se saltan al instante.
         for (int i = MAX_LEVEL - 1; i >= 0; --i) {
-            node* next = curr->forward[i].load(std::memory_order_acquire);
+            node* next = pred->forward[i].load(std::memory_order_relaxed);
+            
+            // Avanzamos mientras el siguiente exista y deba ir antes en la cola de prioridad.
+            // Si comp(next->data, value) es verdadero, next tiene MAYOR prioridad.
             while (next != NIL && comp(next->data, value)) {
-                curr = next;
-                next = curr->forward[i].load(std::memory_order_acquire);
+                pred = next;
+                next = pred->forward[i].load(std::memory_order_relaxed);
             }
-            update[i] = curr;
+            update[i] = pred;
         }
 
-        std::size_t lvl = random_level();
-        node* newNode = new node(value, lvl, NIL);
+        // PASO 2: Creación del nodo
+        // El nodo se crea y se asigna su nivel de forma local, por lo que es seguro 
+        // porque aún no está enlazado a la lista general.
+        std::size_t new_level = random_level();
+        node* new_node = new node(value, new_level, NIL);
 
-        // Inserción de abajo hacia arriba con validación
-        for (std::size_t i = 0; i < lvl; ++i) {
-            bool level_inserted = false;
-            node* predecessor = update[i];
+        // PASO 3: Inserción y validación Bottom-Up (de abajo hacia arriba)
+        for (std::size_t i = 0; i < new_level; ++i) {
+            pred = update[i];
+            
+            while (true) {
+                pred->node_lock.lock();
+                node* next = pred->forward[i].load(std::memory_order_relaxed);
 
-            while (!level_inserted) {
-                // Bloqueamos el predecesor que encontramos antes
-                predecessor->node_lock.lock();
-
-                // VALIDACIÓN: ¿Sigue siendo el nodo anterior correcto?
-                node* nextNode = predecessor->forward[i].load(std::memory_order_acquire);
-                
-                // Si el siguiente nodo es menor que nuestro valor, alguien insertó algo en medio.
-                if (nextNode != NIL && comp(nextNode->data, value)) {
-                    // El predecesor ya no es válido para este nivel.
-                    predecessor->node_lock.unlock();
-                    
-                    // Avanzamos: el nuevo predecesor es el nodo que se coló
-                    predecessor = nextNode; 
-                    
-                    // Seguimos avanzando hasta encontrar el punto justo antes de 'value'
-                    node* actualNext = predecessor->forward[i].load(std::memory_order_acquire);
-                    while (actualNext != NIL && comp(actualNext->data, value)) {
-                        predecessor = actualNext;
-                        actualNext = predecessor->forward[i].load(std::memory_order_acquire);
-                    }
-                    // Reintentamos el bucle while con el nuevo predecessor
-                } else {
-                    // El lugar sigue siendo correcto. Insertamos newNode.
-                    newNode->forward[i].store(nextNode, std::memory_order_relaxed);
-                    predecessor->forward[i].store(newNode, std::memory_order_release);
-                    
-                    predecessor->node_lock.unlock();
-                    level_inserted = true;
+                // Avanzamos si alguien insertó nodos delante de nosotros
+                while (next != NIL && comp(next->data, value)) {
+                    pred->node_lock.unlock();
+                    pred = next;
+                    pred->node_lock.lock();
+                    next = pred->forward[i].load(std::memory_order_relaxed);
                 }
+
+                // VALIDACIÓN CRUCIAL: ¿Nos hemos anclado a un nodo que está siendo borrado?
+                if (pred->marked_for_deletion.load(std::memory_order_relaxed)) {
+                    pred->node_lock.unlock();
+                    
+                    // El predecesor es inválido. Reiniciamos la búsqueda exclusiva para este nivel
+                    pred = header;
+                    next = pred->forward[i].load(std::memory_order_relaxed);
+                    while (next != NIL && comp(next->data, value)) {
+                        pred = next;
+                        next = pred->forward[i].load(std::memory_order_relaxed);
+                    }
+                    continue; // Volvemos al inicio del while(true) para intentar bloquear de nuevo
+                }
+
+                // Si pasamos la validación, el enlace es seguro
+                new_node->forward[i].store(next, std::memory_order_relaxed);
+                pred->forward[i].store(new_node, std::memory_order_release);
+                pred->node_lock.unlock();
+                
+                break; // Terminamos la inserción en este nivel
             }
         }
-        newNode->fully_linked.store(true, std::memory_order_release);
+
+        // PASO 4: Flags finales
+        // Marcamos como fully_linked. Esto es especialmente útil para la operación de borrado o pop.
+        new_node->fully_linked.store(true, std::memory_order_release);
+        
+        // Aumentamos el tamaño de manera atómica
         _size.fetch_add(1, std::memory_order_relaxed);
     }
 
     /**
-     * @brief Intenta extraer el elemento de mayor prioridad.
-     * @return std::optional con el valor, o nullopt si la estructura está saturada o vacía.
+     * @brief Intenta extraer el elemento de mayor prioridad (con relajación).
+     * @return std::optional con el valor, o nullopt si la estructura está vacía.
+     */
+    /**
+     * @brief Intenta extraer el elemento de mayor prioridad (con relajación).
+     * @return std::optional con el valor, o nullopt si la estructura está vacía.
      */
     std::optional<T> try_pop() {
-        // Empezamos desde el primer nodo real
-        node* curr = header->forward[0].load(std::memory_order_acquire);
+        node* target = nullptr;
+        T extracted_value;
 
-        // Recorremos la lista hasta encontrar un nodo capturable o llegar al final
+        // ====================================================================
+        // FASE 1: Búsqueda Relajada y Marcado Lógico (Basado en Delete isGarbage)
+        // ====================================================================
+        node* curr = header->forward[0].load(std::memory_order_relaxed);
+        
+        // El factor de relajación define cuántos elementos "top" podemos saltar 
+        // para evitar que todos los hilos colisionen en el nodo 0.
+        int steps = fast_rand(relaxation_factor); 
+
         while (curr != NIL) {
-            // Solo intentamos capturar si el nodo está totalmente insertado y no está marcado
-            if (curr->fully_linked.load(std::memory_order_acquire) && 
-                !curr->marked_for_deletion.load(std::memory_order_relaxed)) {
+            // Comprobamos si el nodo es un candidato válido sin tomar cerrojos aún
+            if (!curr->marked_for_deletion.load(std::memory_order_relaxed) &&
+                 curr->fully_linked.load(std::memory_order_relaxed)) {
                 
-                // Intento de captura atómica
-                bool expected = false;
-                if (curr->marked_for_deletion.compare_exchange_strong(expected, true)) {
-                    T result = curr->data;
+                if (steps == 0) {
+                    // Hemos alcanzado nuestro candidato. Tomamos el cerrojo (lock(y, level) del paper)
+                    curr->node_lock.lock();
                     
-                    // Sacamos el nodo de la estructura SkipList
-                    detach_node(curr, result); 
-                    
-                    return result;
+                    // Doble comprobación post-cerrojo: ¿Lo marcó otro hilo justo antes?
+                    if (!curr->marked_for_deletion.load(std::memory_order_relaxed) &&
+                         curr->fully_linked.load(std::memory_order_relaxed)) {
+                        
+                        // ¡Nos lo adjudicamos! Lo marcamos como borrado lógico.
+                        // Desde este momento, este nodo es "invisible" para otros pop().
+                        curr->marked_for_deletion.store(true, std::memory_order_release);
+                        extracted_value = curr->data;
+                        target = curr;
+                        curr->node_lock.unlock();
+                        break; // Ya tenemos nuestro objetivo
+                    }
+                    // Si falló la comprobación, lo soltamos y seguimos buscando
+                    curr->node_lock.unlock();
+                } else {
+                    steps--;
                 }
             }
+            curr = curr->forward[0].load(std::memory_order_relaxed);
             
-            // Si el nodo actual estaba ocupado, marcado o no listo, pasamos al siguiente inmediatamente sin esperar.
-            curr = curr->forward[0].load(std::memory_order_acquire);
+            // Si nos pasamos de los elementos de la lista y todavía quedan "steps",
+            // forzamos volver a empezar, pero esta vez cogiendo el primero que veamos.
+            if (curr == NIL && steps > 0) {
+                curr = header->forward[0].load(std::memory_order_relaxed);
+                steps = 0; 
+            }
         }
 
-        // Si llegamos aquí, hemos recorrido toda la lista y no hay nada disponible
-        return std::nullopt;
+        // Si recorrimos todo y no había nada válido, la cola estaba vacía (o sus nodos tomados)
+        if (target == nullptr) {
+            return std::nullopt; 
+        }
+
+       // ====================================================================
+        // FASE 2 y 3: Búsqueda de predecesores y desvinculación segura
+        // ====================================================================
+        node* pred = header;
+        for (int i = MAX_LEVEL - 1; i >= 0; --i) {
+            node* next = pred->forward[i].load(std::memory_order_relaxed);
+            
+            while (next != NIL && comp(next->data, extracted_value)) {
+                pred = next;
+                next = pred->forward[i].load(std::memory_order_relaxed);
+            }
+            
+            while (next != NIL && next != target && !comp(extracted_value, next->data)) {
+                pred = next;
+                next = pred->forward[i].load(std::memory_order_relaxed);
+            }
+
+            if (next == target) {
+                while (true) {
+                    pred->node_lock.lock();
+                    node* locked_next = pred->forward[i].load(std::memory_order_relaxed);
+                    
+                    // Avanzamos por si insertaron un nuevo nodo en medio
+                    while (locked_next != target && locked_next != NIL) {
+                        pred->node_lock.unlock();
+                        pred = locked_next;
+                        pred->node_lock.lock();
+                        locked_next = pred->forward[i].load(std::memory_order_relaxed);
+                    }
+                    
+                    // VALIDACIÓN CRUCIAL: ¿Es nuestro predecesor un nodo borrado por otro hilo?
+                    if (pred->marked_for_deletion.load(std::memory_order_relaxed)) {
+                        pred->node_lock.unlock();
+                        
+                        // Reiniciamos la búsqueda en este nivel
+                        pred = header;
+                        next = pred->forward[i].load(std::memory_order_relaxed);
+                        while (next != NIL && comp(next->data, extracted_value)) {
+                            pred = next;
+                            next = pred->forward[i].load(std::memory_order_relaxed);
+                        }
+                        while (next != NIL && next != target && !comp(extracted_value, next->data)) {
+                            pred = next;
+                            next = pred->forward[i].load(std::memory_order_relaxed);
+                        }
+                        
+                        // Si tras re-buscar el target ya no está en este nivel, salimos
+                        if (next != target) break; 
+                        
+                        continue; // Reintentamos el bloqueo
+                    }
+                    
+                    // Desvinculación física garantizada
+                    if (locked_next == target) {
+                        node* target_next = target->forward[i].load(std::memory_order_relaxed);
+                        pred->forward[i].store(target_next, std::memory_order_release);
+                    }
+                    
+                    pred->node_lock.unlock();
+                    break; // Nivel completado
+                }
+            }
+        }
+
+        // ====================================================================
+        // FASE 4: Limpieza final
+        // ====================================================================
+        _size.fetch_sub(1, std::memory_order_relaxed);
+        
+        // Lo mandamos al Garbage Collector local (que ya tienes definido en skiplist.hpp)
+        retire_node(target); 
+        
+        return extracted_value;
     }
 
     /**
@@ -144,6 +296,20 @@ public:
     }
 
 private:
+    struct node {
+        T data;
+        std::array<std::atomic<node*>, MAX_LEVEL> forward; 
+        Spinlock node_lock;
+        std::atomic<bool> fully_linked{false};
+        std::atomic<bool> marked_for_deletion{false};
+
+        node(T val, std::size_t level, node* nil_ptr) 
+            : data(val) {
+            for (std::size_t i = 0; i < MAX_LEVEL; ++i) {
+                forward[i].store(nil_ptr, std::memory_order_relaxed);
+            }
+        }
+    };
 
     /**
     * @brief Genera un numero aleatorio en [0, max_val]
@@ -168,11 +334,7 @@ private:
      */
     std::size_t random_level() {
         std::size_t lvl = 1;
-        std::recursive_mutex node_lock;
 
-        // Mientras el número aleatorio generado sea menor que P * base
-        // y no hayamos alcanzado el límite máximo definido.
-        // Usamos 100 como base para que el 0.5 de P sea fácil de comparar.
         while (fast_rand(100) < (P * 100) && lvl < MAX_LEVEL) {
             lvl++;
         }
@@ -180,57 +342,18 @@ private:
         return lvl;
     }
 
-    /**
-     * @brief Función auxiliar usada para marcar y eliminar un nodo de la lista.
-     */
-    void detach_node(node* target, const T& value) {
-        node* update[MAX_LEVEL];
-        node* curr = header;
-
-        // Buscamos los predecesores específicos para este nodo 'target'
-        for (int i = MAX_LEVEL - 1; i >= 0; --i) {
-            node* next = curr->forward[i].load(std::memory_order_acquire);
-            while (next != NIL && (comp(next->data, value) || next == target)) {
-                if (next == target) break;
-                curr = next;
-                next = curr->forward[i].load(std::memory_order_acquire);
-            }
-            update[i] = curr;
-        }
-
-        // Desenlazamos con locks de grano fino nivel a nivel
-        for (int i = (int)target->forward.size() - 1; i >= 0; --i) {
-            std::lock_guard<std::recursive_mutex> lock(update[i]->node_lock);
-            if (update[i]->forward[i].load() == target) {
-                update[i]->forward[i].store(target->forward[i].load(), std::memory_order_release);
-            }
-        }
-        _size.fetch_sub(1, std::memory_order_relaxed);
-    }
-
-    static constexpr std::size_t MAX_LEVEL = 32; // Suficiente para miles de millones de elementos
     static constexpr float P = 0.5; // Probabilidad de subir de nivel
     node* header; // Nodo cabecera, es de nivel maximo y apunta al inicio de la estructura
     node* NIL; // Nodo centinela, marca el final de la estructura
     std::size_t current_level;
     Compare comp;
     std::atomic<std::size_t> _size{0}; // Numero de elementos en la estructura
+    int relaxation_factor;
 
-    struct node {
-        T data;
-        std::vector<std::atomic<node*>> forward; // El puntero en la posicion i apunta al siguiente elemento de nivel i o superior
-        std::atomic<bool> fully_linked{false}; // El nodo terminó su push
-        std::atomic<bool> marked_for_deletion{false}; // El nodo está siendo extraído
-
-        node(T val, std::size_t level, node* nil_ptr) // Da valor a data y reserva level espacios en foward inicializandolos a NIL
-            : data(val), forward(level) { // Solo reservamos el tamaño
-            
-            // Inicializamos cada nivel manualmente
-            for (std::size_t i = 0; i < level; ++i) {
-                forward[i].store(nil_ptr, std::memory_order_relaxed);
-            }
-        }
-    };
+    void retire_node(node* n) {
+        static thread_local std::vector<node*> local_garbage;
+        local_garbage.push_back(n);
+    }
 };
 
 #endif
