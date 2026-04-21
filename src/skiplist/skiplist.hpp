@@ -9,17 +9,33 @@
 #include <thread> // Para std::this_thread::yield()
 #include <array>  // Para std::array<...> en push y la estructura node
 #include <random> // Para std::random_device en fast_rand
+#include <immintrin.h> // Necesario para _mm_pause()
 
 class Spinlock {
     std::atomic_flag locked = ATOMIC_FLAG_INIT;
 public:
     void lock() {
-        // Intentamos adquirir el cerrojo activamente
+        int backoff = 1;
         while (locked.test_and_set(std::memory_order_acquire)) {
-            // Ceder un poco la CPU evita quemar el 100% si hay alta contención
-            std::this_thread::yield(); 
+            // Exponential backoff: si fallamos, esperamos un poco más cada vez
+            // usando la instrucción de hardware de pausa (muy rápida, no invoca al SO)
+            for (int i = 0; i < backoff; ++i) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+                _mm_pause(); // Pausa la pipeline de la CPU sin saturar el bus
+#else
+                // Fallback para arquitecturas no x86 (como ARM)
+                std::this_thread::yield(); 
+#endif
+            }
+            if (backoff < 1024) {
+                backoff *= 2; 
+            } else {
+                // Si ya esperamos mucho, entonces sí cedemos la CPU al SO
+                std::this_thread::yield();
+            }
         }
     }
+    
     void unlock() {
         locked.clear(std::memory_order_release);
     }
@@ -53,6 +69,7 @@ public:
         header = new node(T(), MAX_LEVEL, NIL);
     }
 
+    /*
     ~Skiplist() {
         node* curr = header;
         while (curr != nullptr) {
@@ -65,6 +82,7 @@ public:
             curr = next;
         }
     }
+    */
 
     /**
      * @brief Inserta un elemento de forma concurrente.
@@ -94,7 +112,8 @@ public:
         // El nodo se crea y se asigna su nivel de forma local, por lo que es seguro 
         // porque aún no está enlazado a la lista general.
         std::size_t new_level = random_level();
-        node* new_node = new node(value, new_level, NIL);
+        // Usamos nuestro asignador local libre de bloqueos
+        node* new_node = allocate_node(value, new_level, NIL);
 
         // PASO 3: Inserción y validación Bottom-Up (de abajo hacia arriba)
         for (std::size_t i = 0; i < new_level; ++i) {
@@ -350,9 +369,36 @@ private:
     std::atomic<std::size_t> _size{0}; // Numero de elementos en la estructura
     int relaxation_factor;
 
-    void retire_node(node* n) {
+    void retire_node(node* n) { // Actualmente no se borran
         static thread_local std::vector<node*> local_garbage;
         local_garbage.push_back(n);
+    }
+
+    node* allocate_node(T val, std::size_t level, node* nil_ptr) {
+        // Cuántos nodos reservamos de golpe cada vez que hablamos con el SO
+        constexpr int CHUNK_SIZE = 4096; 
+        
+        // Memoria en bruto. Al ser thread_local, cada hilo tiene su propia arena independiente
+        static thread_local uint8_t* memory_block = nullptr;
+        static thread_local int nodes_allocated = 0;
+
+        // Si es la primera vez o nos hemos quedado sin espacio en nuestro bloque
+        if (nodes_allocated == CHUNK_SIZE || memory_block == nullptr) {
+            // Pedimos un gran bloque de memoria "cruda" al sistema operativo de una sola vez
+            // ::operator new solo reserva el espacio (como malloc en C), sin llamar constructores
+            memory_block = static_cast<uint8_t*>(::operator new(CHUNK_SIZE * sizeof(node)));
+            nodes_allocated = 0;
+        }
+
+        // Calculamos la dirección de memoria exacta donde irá el nuevo nodo
+        node* new_ptr = reinterpret_cast<node*>(memory_block + (nodes_allocated * sizeof(node)));
+        
+        // PLACEMENT NEW: Le decimos a C++ "Construye un objeto 'node' exactamente en esta dirección"
+        new (new_ptr) node(val, level, nil_ptr);
+        
+        nodes_allocated++;
+        
+        return new_ptr;
     }
 };
 
