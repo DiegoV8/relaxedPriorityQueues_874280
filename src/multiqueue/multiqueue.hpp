@@ -8,6 +8,7 @@
 #include <mutex>
 #include <memory>
 #include <algorithm>
+#include <queue>
 
 /**
  * @brief Interfaz para una Multiqueue.
