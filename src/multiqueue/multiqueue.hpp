@@ -126,6 +126,26 @@ public:
         return sum;
     }
 
+    /**
+     * @brief Devuelve la concatenacion de todas las colas para uso más eficiente en regions-adaptative-multiqueue. No modifica la cola
+     */
+    std::vector<T> drain() const {
+        std::vector<T> res;
+        
+        for (std::size_t i = 0; i < n; ++i) {
+            std::lock_guard<std::mutex> lock(queues[i]->M);
+            
+            // Copiamos la pq para no modificar la original
+            auto pq_copy = queues[i]->pq;
+            
+            while (!pq_copy.empty()) {
+                res.push_back(pq_copy.top());
+                pq_copy.pop();
+            }
+        }
+        
+        return res;
+    }
 private:
 
     /**

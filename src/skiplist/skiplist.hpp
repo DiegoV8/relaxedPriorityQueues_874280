@@ -402,10 +402,13 @@ public:
         node* target = nullptr;
         T extracted_value;
 
+        // En skiplist.hpp, dentro de try_pop()
+        std::size_t current_size = _size.load(std::memory_order_relaxed);
+        int steps = (relaxation_factor > 0 && current_size > (std::size_t)relaxation_factor) 
+                    ? (int)fast_rand(relaxation_factor) : 0;
+
         // FASE 1: búsqueda relajada y marcado lógico
         node* curr = header->forward[0].load(std::memory_order_relaxed);
-
-        int steps = (relaxation_factor > 0) ? (int)fast_rand(relaxation_factor) : 0;
 
         while (curr != NIL) {
             if (!curr->marked_for_deletion.load(std::memory_order_relaxed) &&
