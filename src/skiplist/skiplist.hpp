@@ -31,6 +31,14 @@ public:
             else std::this_thread::yield();
         }
     }
+
+    // AÑADE ESTO:
+    bool try_lock() {
+        // test_and_set devuelve el valor anterior. 
+        // Si devuelve false, es que estaba libre y ahora lo hemos bloqueado.
+        return !locked.test_and_set(std::memory_order_acquire);
+    }
+
     void unlock() {
         locked.clear(std::memory_order_release);
     }
@@ -317,7 +325,7 @@ public:
     using value_type = T;
 
     explicit Skiplist(Compare comp = Compare(), int rel_factor = 0)
-        : comp(comp), current_level(1), relaxation_factor(rel_factor)
+        : current_level(1), comp(comp), relaxation_factor(rel_factor)
     {
         thread_slabs.fill(nullptr);
         thread_garbage.fill(nullptr);
@@ -355,55 +363,48 @@ public:
         int tidx = get_thread_idx();
         enter_epoch(tidx);
 
-        std::array<node*, MAX_LEVEL> update;
-        node* pred = header;
-
-        for (int i = MAX_LEVEL - 1; i >= 0; --i) {
-            node* next = pred->forward[i].load(std::memory_order_relaxed);
-            while (next != NIL && comp(next->get_data(), value)) {
-                pred = next;
-                next = pred->forward[i].load(std::memory_order_relaxed);
-            }
-            update[i] = pred;
-        }
-
         std::size_t new_level = random_level();
         node* new_node = allocate_node(tidx, value, new_level, NIL);
 
-        for (std::size_t i = 0; i < new_level; ++i) {
-            pred = update[i];
-            while (true) {
-                pred->node_lock.lock();
-                node* next = pred->forward[i].load(std::memory_order_relaxed);
+        std::array<node*, MAX_LEVEL> preds;
+        std::array<node*, MAX_LEVEL> succs;
 
+        while (true) {
+            node* curr = header;
+            // Localizamos los candidatos a predecesores/sucesores
+            for (int i = MAX_LEVEL - 1; i >= 0; --i) {
+                node* next = curr->forward[i].load(std::memory_order_acquire);
                 while (next != NIL && comp(next->get_data(), value)) {
-                    pred->node_lock.unlock();
-                    pred = next;
-                    pred->node_lock.lock();
-                    next = pred->forward[i].load(std::memory_order_relaxed);
+                    curr = next;
+                    next = curr->forward[i].load(std::memory_order_acquire);
                 }
-
-                if (pred->marked_for_deletion.load(std::memory_order_relaxed)) {
-                    pred->node_lock.unlock();
-                    pred = header;
-                    next = pred->forward[i].load(std::memory_order_relaxed);
-                    while (next != NIL && comp(next->get_data(), value)) {
-                        pred = next;
-                        next = pred->forward[i].load(std::memory_order_relaxed);
-                    }
-                    continue;
-                }
-
-                new_node->forward[i].store(next, std::memory_order_relaxed);
-                pred->forward[i].store(new_node, std::memory_order_release);
-                pred->node_lock.unlock();
-                break;
+                preds[i] = curr;
+                succs[i] = next;
             }
+
+            // Bloqueamos el predecesor del nivel 0 para garantizar la inserción lineal
+            node* pred0 = preds[0];
+            pred0->node_lock.lock();
+
+            // VALIDACIÓN: ¿Sigue siendo válida la posición?
+            if (pred0->marked_for_deletion.load(std::memory_order_acquire) || 
+                pred0->forward[0].load(std::memory_order_acquire) != succs[0]) {
+                pred0->node_lock.unlock();
+                continue; // Reintentar si otro hilo modificó la lista
+            }
+
+            // Enlace físico
+            for (std::size_t i = 0; i < new_level; ++i) {
+                new_node->forward[i].store(succs[i], std::memory_order_relaxed);
+                preds[i]->forward[i].store(new_node, std::memory_order_release);
+            }
+
+            new_node->fully_linked.store(true, std::memory_order_release);
+            pred0->node_lock.unlock();
+            break;
         }
 
-        new_node->fully_linked.store(true, std::memory_order_release);
         _size.fetch_add(1, std::memory_order_relaxed);
-
         exit_epoch(tidx);
     }
 
@@ -415,39 +416,36 @@ public:
         node* target = nullptr;
         T extracted_value;
 
-        // En skiplist.hpp, dentro de try_pop()
+        // Determinamos pasos de relajación
         std::size_t current_size = _size.load(std::memory_order_relaxed);
         int steps = (relaxation_factor > 0 && current_size > (std::size_t)relaxation_factor) 
                     ? (int)fast_rand(relaxation_factor) : 0;
 
-        // FASE 1: búsqueda relajada y marcado lógico
-        node* curr = header->forward[0].load(std::memory_order_relaxed);
+        // FASE 1: Búsqueda Lógica (No bloqueante)
+        // Usamos acquire para ver los cambios de punteros de otros hilos
+        node* curr = header->forward[0].load(std::memory_order_acquire);
 
         while (curr != NIL) {
-            if (!curr->marked_for_deletion.load(std::memory_order_relaxed) &&
-                 curr->fully_linked.load(std::memory_order_relaxed)) {
-
-                if (steps == 0) {
-                    curr->node_lock.lock();
-                    if (!curr->marked_for_deletion.load(std::memory_order_relaxed) &&
-                         curr->fully_linked.load(std::memory_order_relaxed)) {
-                        curr->marked_for_deletion.store(true, std::memory_order_release);
-                        extracted_value = curr->get_data();
-                        target = curr;
+            if (curr->fully_linked.load(std::memory_order_acquire) && 
+                !curr->marked_for_deletion.load(std::memory_order_acquire)) {
+                
+                if (steps <= 0) {
+                    // Intentamos bloquear. Si falla, pasamos al siguiente (evita deadlocks)
+                    if (curr->node_lock.try_lock()) {
+                        if (!curr->marked_for_deletion.load(std::memory_order_relaxed)) {
+                            curr->marked_for_deletion.store(true, std::memory_order_release);
+                            extracted_value = curr->get_data();
+                            target = curr;
+                            curr->node_lock.unlock();
+                            break;
+                        }
                         curr->node_lock.unlock();
-                        break;
                     }
-                    curr->node_lock.unlock();
                 } else {
                     steps--;
                 }
             }
-            curr = curr->forward[0].load(std::memory_order_relaxed);
-
-            if (curr == NIL && steps > 0) {
-                curr = header->forward[0].load(std::memory_order_relaxed);
-                steps = 0;
-            }
+            curr = curr->forward[0].load(std::memory_order_acquire);
         }
 
         if (target == nullptr) {
@@ -455,61 +453,44 @@ public:
             return std::nullopt;
         }
 
-        // FASE 2 y 3: desvinculación física
+        // FASE 2 y 3: Desvinculación Física (Lazy)
+        // Buscamos los predecesores para desenlazar
         node* pred = header;
         for (int i = MAX_LEVEL - 1; i >= 0; --i) {
-            node* next = pred->forward[i].load(std::memory_order_relaxed);
+            node* next = pred->forward[i].load(std::memory_order_acquire);
 
-            while (next != NIL && comp(next->get_data(), extracted_value))  {
-                pred = next;
-                next = pred->forward[i].load(std::memory_order_relaxed);
-            }
-            while (next != NIL && next != target && !comp(extracted_value, next->get_data())) {
-                pred = next;
-                next = pred->forward[i].load(std::memory_order_relaxed);
+            // Búsqueda de la posición del target en este nivel
+            while (next != NIL) {
+                if (next == target) break;
+                // Si el nodo actual es menor que el target, avanzamos
+                if (comp(next->get_data(), extracted_value)) {
+                    pred = next;
+                    next = pred->forward[i].load(std::memory_order_acquire);
+                } else if (!comp(extracted_value, next->get_data())) {
+                    // Si tienen igual prioridad pero no es nuestro target, avanzamos
+                    pred = next;
+                    next = pred->forward[i].load(std::memory_order_acquire);
+                } else {
+                    break; // Nos hemos pasado
+                }
             }
 
             if (next == target) {
-                while (true) {
-                    pred->node_lock.lock();
-                    node* locked_next = pred->forward[i].load(std::memory_order_relaxed);
-
-                    while (locked_next != target && locked_next != NIL) {
-                        pred->node_lock.unlock();
-                        pred = locked_next;
-                        pred->node_lock.lock();
-                        locked_next = pred->forward[i].load(std::memory_order_relaxed);
-                    }
-
-                    if (pred->marked_for_deletion.load(std::memory_order_relaxed)) {
-                        pred->node_lock.unlock();
-                        pred = header;
-                        next = pred->forward[i].load(std::memory_order_relaxed);
-                        while (next != NIL && comp(next->get_data(), extracted_value)) {
-                            pred = next;
-                            next = pred->forward[i].load(std::memory_order_relaxed);
-                        }
-                        while (next != NIL && next != target && !comp(extracted_value, next->get_data())) {
-                            pred = next;
-                            next = pred->forward[i].load(std::memory_order_relaxed);
-                        }
-                        if (next != target) break;
-                        continue;
-                    }
-
-                    if (locked_next == target) {
+                // Intentamos desvincular. Si el predecesor está ocupado, 
+                // no insistimos (lo hará otro hilo o el drain final)
+                if (pred->node_lock.try_lock()) {
+                    if (pred->forward[i].load(std::memory_order_relaxed) == target) {
                         node* target_next = target->forward[i].load(std::memory_order_relaxed);
                         pred->forward[i].store(target_next, std::memory_order_release);
                     }
                     pred->node_lock.unlock();
-                    break;
                 }
             }
         }
 
-        // FASE 4: retiro seguro vía EBR en lugar de acumular sin liberar
+        // FASE 4: Finalización
         _size.fetch_sub(1, std::memory_order_relaxed);
-        retire_node(tidx, target);
+        retire_node(tidx, target); // Registro en EBR para liberación segura
 
         exit_epoch(tidx);
         return extracted_value;
