@@ -289,19 +289,15 @@ public:
 
                 if (next == target) {
                     pred->node_lock.lock();
-                    
-                    // CORRECCIÓN: Validar que pred no solo apunte a target, sino que siga vivo
-                    if (pred->forward[i].load(std::memory_order_relaxed) == target &&
-                        !pred->marked_for_deletion.load(std::memory_order_relaxed)) { // <-- NUEVO
-                        
+                    // Revalidar: puede que otro hilo ya lo haya desvinculado o insertado algo en medio
+                    if (pred->forward[i].load(std::memory_order_relaxed) == target) {
                         node* target_next = target->forward[i].load(std::memory_order_relaxed);
                         pred->forward[i].store(target_next, std::memory_order_release);
-                        unlinked = true; // Éxito
+                        unlinked = true; // Éxito, podemos avanzar al siguiente nivel
                     }
                     pred->node_lock.unlock();
                     
-                    // Si la validación falla (ej. pred fue marcado), unlinked sigue siendo 'false' 
-                    // y el bucle while(!unlinked) te obliga a reiniciar desde el header correctamente.
+                    // Si la validación falló, unlinked sigue siendo 'false' y el while obliga a reintentar
                 } else {
                     // No se encontró en este nivel. Puede que el nodo original
                     // no haya llegado a crecer hasta este nivel (new_level).
