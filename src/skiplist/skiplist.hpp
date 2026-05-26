@@ -321,7 +321,7 @@ public:
     Compare                  comp;
     std::atomic<std::size_t> _size{0};
     int                      relaxation_factor;
-    tatic constexpr float P = 0.5f;
+    static constexpr float P = 0.5f;
 
     std::mutex           retired_mutex;
     std::vector<node*>   retired_nodes;
