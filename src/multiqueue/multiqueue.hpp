@@ -18,11 +18,10 @@
 template <typename T, typename Compare = std::less<T>>
 class Multiqueue {
 public:
-    // Alias para compatibilidad con los tests de estructuras de datos
     using value_type = T;
 
     /**
-     * @brief Constructor que define el grado de relajación.
+     * @brief Constructor para la Multiqueue.
      * @param n Número de sub-colas internas.
      * @param c Número de sub-colas que se comparan al extraer elementos.
      * @param comp Instancia del comparador de prioridad.
@@ -32,10 +31,8 @@ public:
         this->c = c;
         this->comp = comp;
 
-        // Reservamos espacio para cada cola
         queues.reserve(n);
-        
-        // Inicializamos cada shard como un puntero único
+
         for (std::size_t i = 0; i < n; ++i) {
             queues.push_back(std::make_unique<Q>(comp));
         }
@@ -43,12 +40,12 @@ public:
 
     /**
      * @brief Inserta un elemento de forma concurrente.
+     * @param value Valor a insertar en la estructura
      */
     void push(const T& value){
         
         std::size_t i = fast_rand(n);
         {
-            // Usamos -> porque ahora queues[i] es un puntero
             std::lock_guard<std::mutex> lock(queues[i]->M); 
             queues[i]->pq.push(value);
         }
@@ -63,26 +60,21 @@ public:
         std::vector<std::size_t> locked_indices;
         int best_idx = -1;
 
-        // Intentamos muestrear y bloquear hasta 'c' colas
         for (int i = 0; i < c; ++i) {
             std::size_t idx = fast_rand(n);
             
-            // Comprobamos si ya tenemos esta cola bloqueada
             if (std::find(locked_indices.begin(), locked_indices.end(), idx) != locked_indices.end()) {
-                continue; // Ya la tenemos, pasamos al siguiente intento
+                continue;
             }
             
-            // Intentamos bloquear
             if (queues[idx]->M.try_lock()) {
                 if (!queues[idx]->pq.empty()) {
                     locked_indices.push_back(idx);
                     
-                    // Comprobamos si es el elemento con mayor prioridad
                     if (best_idx == -1 || comp(queues[best_idx]->pq.top(), queues[idx]->pq.top())) {
                         best_idx = idx;
                     }
                 } else {
-                    // Si estaba vacía, la desbloqueamos ya
                     queues[idx]->M.unlock();
                 }
             }
@@ -99,12 +91,12 @@ public:
         for (std::size_t idx : locked_indices) {
             queues[idx]->M.unlock();
         }
-
         return result;
     }
 
     /**
      * @brief Comprueba si todas las colas internas están vacías.
+     * @return bool con True si la estructura esta vacía y False si no.
      */
     bool empty() const {
         for (std::size_t i = 0; i < n; i++){
@@ -115,7 +107,8 @@ public:
     }
 
     /**
-     * @brief Retorna el número aproximado de elementos.
+     * @brief Retorna el número aproximado de elementos en la estructura.
+     * @return std::size_t con el valor aproximado del numero de elementos en la Multiqueue.
      */
     std::size_t size() const {
         std::size_t sum = 0;
@@ -127,7 +120,8 @@ public:
     }
 
     /**
-     * @brief Devuelve la concatenacion de todas las colas para uso más eficiente en regions-adaptative-multiqueue. No modifica la cola
+     * @brief Devuelve la concatenacion de todas las colas para uso más eficiente en regions-adaptative-multiqueue. No modifica la cola.
+     * @return std::vector<T> con todos los elementos en la estructura sin ordenar.
      */
     std::vector<T> drain() const {
         std::vector<T> res;
@@ -135,7 +129,6 @@ public:
         for (std::size_t i = 0; i < n; ++i) {
             std::lock_guard<std::mutex> lock(queues[i]->M);
             
-            // Copiamos la pq para no modificar la original
             auto pq_copy = queues[i]->pq;
             
             while (!pq_copy.empty()) {
@@ -143,16 +136,16 @@ public:
                 pq_copy.pop();
             }
         }
-        
         return res;
     }
 private:
 
     /**
-    * @brief Genera un numero aleatorio en [0, max_val]
-    * @param max_val Valor máximo generado 
+    * @brief Genera un numero aleatorio en [0, max_val] usando un algoritmo Xorshift.
+    * @param max_val Valor máximo generado.
+    * @return std::size_t con valor en [0, max_val].
     */
-    inline std::size_t fast_rand(std::size_t max_val) { // Algoritmo de numeros aleatorios Xorshift
+    inline std::size_t fast_rand(std::size_t max_val) {
         static thread_local uint32_t state = []() {
             uint32_t seed = std::random_device{}();
             return seed == 0 ? 1 : seed;
@@ -165,18 +158,18 @@ private:
         return state % max_val;
     }
 
-    struct Q { // Representa cada una de las colas de la multiqueue
+    // Estructura usada para representar cada una de las colas en la Multiqueue.
+    struct Q {
         std::priority_queue<T, std::vector<T>, Compare> pq;
         mutable std::mutex M;
-
-        // Inicializa la pq con el comparador
         Q(const Compare& comp) : pq(comp) {}
     };
 
-    std::vector<std::unique_ptr<Q>> queues; // Vector de Colas
-    std::size_t n; // Numero de colas en la Multiqueue
-    int c; // Numero de colas a comparar durante la extracción, típicamente 2
-    Compare comp; // Comparador de prioridad de elementos
+    // Atributos internos de la Multiqueue.
+    std::vector<std::unique_ptr<Q>> queues;
+    std::size_t n;
+    int c;
+    Compare comp;
     
 };
 

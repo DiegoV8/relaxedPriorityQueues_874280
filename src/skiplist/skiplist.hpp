@@ -12,9 +12,7 @@
 #include <algorithm>
 #include <immintrin.h>
 
-// =============================================================================
-// Spinlock
-// =============================================================================
+// Clase Spinlock usada para gestionar el bloqueo de nodos de Skiplist.
 class Spinlock {
     std::atomic_flag locked = ATOMIC_FLAG_INIT;
 public:
@@ -22,11 +20,11 @@ public:
         int backoff = 1;
         while (locked.test_and_set(std::memory_order_acquire)) {
             for (int i = 0; i < backoff; ++i) {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
-                _mm_pause();
-#else
-                std::this_thread::yield();
-#endif
+                #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+                                _mm_pause();
+                #else
+                                std::this_thread::yield();
+                #endif
             }
             if (backoff < 1024) backoff *= 2;
             else std::this_thread::yield();
@@ -42,82 +40,21 @@ public:
     }
 };
 
-// =============================================================================
-// Skiplist
-// =============================================================================
+/**
+ * @brief Interfaz para una Skiplist.
+ * @tparam T Tipo de dato.
+ * @tparam Compare Comparador.
+ */
 template <typename T, typename Compare = std::greater<T>>
 class Skiplist {
-private:
-    static constexpr std::size_t MAX_LEVEL = 16; 
-
-    // =========================================================================
-    // Nodo
-    // =========================================================================
-    struct node {
-        alignas(T) unsigned char data_buffer[sizeof(T)];
-
-        std::array<std::atomic<node*>, MAX_LEVEL> forward;
-        Spinlock node_lock;
-        std::atomic<bool> fully_linked{false};
-        std::atomic<bool> marked_for_deletion{false};
-
-        node(T val, std::size_t /*level*/, node* nil_ptr) {
-            new (data_buffer) T(std::move(val));
-            for (std::size_t i = 0; i < MAX_LEVEL; ++i)
-                forward[i].store(nil_ptr, std::memory_order_relaxed);
-        }
-
-        node(std::size_t /*level*/, node* nil_ptr) {
-            for (std::size_t i = 0; i < MAX_LEVEL; ++i)
-                forward[i].store(nil_ptr, std::memory_order_relaxed);
-        }
-
-        T& get_data() {
-            return *reinterpret_cast<T*>(data_buffer);
-        }
-    };
-
-    // =========================================================================
-    // Generador de nivel aleatorio (Xorshift)
-    // =========================================================================
-    static constexpr float P = 0.5f;
-
-    inline std::size_t fast_rand(std::size_t max_val) {
-        static thread_local uint32_t state = []() {
-            uint32_t seed = std::random_device{}();
-            return seed == 0 ? 1 : seed;
-        }();
-        state ^= state << 13;
-        state ^= state >> 17;
-        state ^= state << 5;
-        return state % max_val;
-    }
-
-    std::size_t random_level() {
-        std::size_t lvl = 1;
-        while (fast_rand(100) < (std::size_t)(P * 100) && lvl < MAX_LEVEL)
-            lvl++;
-        return lvl;
-    }
-
-    node* header;
-    node* NIL;
-    std::size_t              current_level;
-    Compare                  comp;
-    std::atomic<std::size_t> _size{0};
-    int                      relaxation_factor;
-
-    std::mutex           retired_mutex;
-    std::vector<node*>   retired_nodes;
-
-    void retire_node(node* n) {
-        std::lock_guard<std::mutex> lk(retired_mutex);
-        retired_nodes.push_back(n);
-    }
-
 public:
     using value_type = T;
 
+    /**
+     * @brief Constructor para la Skiplist.
+     * @param comp Instancia del comparador de prioridad.
+     * @param rel_factor Grado de relajación de la estructura.
+     */
     explicit Skiplist(Compare comp = Compare(), int rel_factor = 0)
         : current_level(1), comp(comp), relaxation_factor(rel_factor)
     {
@@ -125,6 +62,9 @@ public:
         header = new node(MAX_LEVEL, NIL);
     }
 
+    /**
+     * @brief Destructor para la Skiplist.
+     */
     ~Skiplist() {
         node* curr = header->forward[0].load(std::memory_order_relaxed);
         while (curr != NIL) {
@@ -142,7 +82,10 @@ public:
             delete n;
     }
 
-    // -------------------------------------------------------------------------
+    /**
+     * @brief Inserta un elemento de forma concurrente.
+     * @param value Valor a insertar en la estructura
+     */
     void push(T value) {
         std::size_t new_level = random_level();
         node* new_node = new node(value, new_level, NIL);
@@ -200,7 +143,10 @@ public:
         _size.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // -------------------------------------------------------------------------
+    /**
+     * @brief Intenta extraer el elemento de mayor prioridad.
+     * @return std::optional con el valor, o nullopt si la estructura está saturada o vacía.
+     */
     std::optional<T> try_pop() {
         node* target = nullptr;
         T extracted_value;
@@ -209,7 +155,6 @@ public:
         int steps = (relaxation_factor > 0 && current_size > (std::size_t)relaxation_factor)
                     ? (int)fast_rand(relaxation_factor) : 0;
 
-        // FASE 1: Lock-Free Logical Deletion (Sin bloqueos, ultra rápido)
         node* curr = header->forward[0].load(std::memory_order_acquire);
         while (curr != NIL) {
             if (curr->fully_linked.load(std::memory_order_acquire) &&
@@ -217,13 +162,11 @@ public:
 
                 if (steps <= 0) {
                     bool expected = false;
-                    // CAS atómico: Si conseguimos marcarlo, el nodo es nuestro y salimos.
                     if (curr->marked_for_deletion.compare_exchange_strong(expected, true, std::memory_order_acquire)) {
                         extracted_value = curr->get_data();
                         target = curr;
                         break;
                     }
-                    // Si falla, significa que otro hilo lo robó antes. Seguimos intentando.
                 } else {
                     steps--;
                 }
@@ -235,7 +178,6 @@ public:
             return std::nullopt;
         }
 
-        // FASE 2: Desvinculación "Zombie-Sweeping"
         for (int i = MAX_LEVEL - 1; i >= 0; --i) {
             bool unlinked = false;
             
@@ -245,7 +187,6 @@ public:
 
                 while (next != NIL && next != target) {
                     if (comp(next->get_data(), extracted_value) || !comp(extracted_value, next->get_data())) {
-                        // CLAVE: Solo avanzamos "pred" si el nodo NO está marcado para borrar.
                         if (!next->marked_for_deletion.load(std::memory_order_acquire)) {
                             pred = next;
                         }
@@ -257,12 +198,10 @@ public:
 
                 if (next == target) {
                     pred->node_lock.lock();
-                    // Validamos que nuestro ancla (pred) siga estando limpia
                     if (!pred->marked_for_deletion.load(std::memory_order_relaxed)) {
                         bool valid = true;
                         node* curr_trace = pred->forward[i].load(std::memory_order_relaxed);
                         
-                        // Verificamos que no haya entrado un nodo limpio nuevo entre pred y target
                         while (curr_trace != target) {
                             if (curr_trace == NIL || !curr_trace->marked_for_deletion.load(std::memory_order_relaxed)) {
                                 valid = false;
@@ -271,7 +210,6 @@ public:
                             curr_trace = curr_trace->forward[i].load(std::memory_order_relaxed);
                         }
                         
-                        // Si todo es válido, desvinculamos target Y limpiamos toda la basura intermedia
                         if (valid) {
                             node* target_next = target->forward[i].load(std::memory_order_relaxed);
                             pred->forward[i].store(target_next, std::memory_order_release);
@@ -292,16 +230,26 @@ public:
         return extracted_value;
     }
 
-    // -------------------------------------------------------------------------
+    /**
+     * @brief Comprueba si la estructura está vacía.
+     * @return bool con True si la estructura esta vacía y False si no.
+     */
     bool empty() const {
         return _size.load(std::memory_order_relaxed) == 0;
     }
 
+    /**
+     * @brief Retorna el número aproximado de elementos.
+     * @return std::size_t con el valor aproximado del numero de elementos en la Skiplist.
+     */
     std::size_t size() const {
         return _size.load(std::memory_order_relaxed);
     }
 
-    // -------------------------------------------------------------------------
+    /**
+     * @brief Devuelve la concatenacion de todos los nodos para uso más eficiente en regions-adaptative-multiqueue. No modifica la cola.
+     * @return std::vector<T> con todos los elementos en la estructura sin ordenar.
+     */
     std::vector<T> drain() {
         std::vector<T> result;
 
@@ -320,6 +268,82 @@ public:
         }
 
         return result;
+    }
+
+    private:
+    static constexpr std::size_t MAX_LEVEL = 16; 
+
+    // Estructura usada para representar cada nodo en la Skiplist.
+    struct node {
+        alignas(T) unsigned char data_buffer[sizeof(T)];
+
+        std::array<std::atomic<node*>, MAX_LEVEL> forward;
+        Spinlock node_lock;
+        std::atomic<bool> fully_linked{false};
+        std::atomic<bool> marked_for_deletion{false};
+
+        node(T val, std::size_t /*level*/, node* nil_ptr) {
+            new (data_buffer) T(std::move(val));
+            for (std::size_t i = 0; i < MAX_LEVEL; ++i)
+                forward[i].store(nil_ptr, std::memory_order_relaxed);
+        }
+
+        node(std::size_t /*level*/, node* nil_ptr) {
+            for (std::size_t i = 0; i < MAX_LEVEL; ++i)
+                forward[i].store(nil_ptr, std::memory_order_relaxed);
+        }
+
+        T& get_data() {
+            return *reinterpret_cast<T*>(data_buffer);
+        }
+    };
+
+    /**
+    * @brief Genera un numero aleatorio en [0, max_val] usando un algoritmo Xorshift.
+    * @param max_val Valor máximo generado.
+    * @return std::size_t con valor en [0, max_val].
+    */
+    inline std::size_t fast_rand(std::size_t max_val) {
+        static thread_local uint32_t state = []() {
+            uint32_t seed = std::random_device{}();
+            return seed == 0 ? 1 : seed;
+        }();
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        return state % max_val;
+    }
+
+    // Atributos internos de la Skiplist.
+    node* header;
+    node* NIL;
+    std::size_t              current_level;
+    Compare                  comp;
+    std::atomic<std::size_t> _size{0};
+    int                      relaxation_factor;
+    tatic constexpr float P = 0.5f;
+
+    std::mutex           retired_mutex;
+    std::vector<node*>   retired_nodes;
+
+    /**
+    * @brief Genera un nivel aleatorio para un nodo, hay una probabilidad 1/(2i−1) de alcanzar el nivel i.
+    * @return std::size_t con valor en [0, MAX_LEVEL].
+    */
+    std::size_t random_level() {
+        std::size_t lvl = 1;
+        while (fast_rand(100) < (std::size_t)(P * 100) && lvl < MAX_LEVEL)
+            lvl++;
+        return lvl;
+    }
+
+    /**
+    * @brief Manda un nodo a la lista de nodos a ser borrados.
+    * @param n nodo a ser retirado.
+    */
+    void retire_node(node* n) {
+        std::lock_guard<std::mutex> lk(retired_mutex);
+        retired_nodes.push_back(n);
     }
 };
 
