@@ -328,10 +328,10 @@ public:
 
     /**
     * @brief Genera un nivel aleatorio para un nodo, hay una probabilidad 1/(2i−1) de alcanzar el nivel i.
-    * @return std::size_t con valor en [0, MAX_LEVEL].
+    * @return std::size_t con valor en [1, MAX_LEVEL].
     */
     std::size_t random_level() {
-        std::size_t lvl = 0;
+        std::size_t lvl = 1;
         while (fast_rand(100) < (std::size_t)(P * 100) && lvl < MAX_LEVEL)
             lvl++;
         return lvl;
